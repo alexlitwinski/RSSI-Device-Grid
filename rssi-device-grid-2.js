@@ -376,6 +376,9 @@ class RssiDeviceGrid extends HTMLElement {
       .rssi-value {
         font-family: monospace;
         font-size: 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
       }
       
       .rssi-good {
@@ -388,6 +391,36 @@ class RssiDeviceGrid extends HTMLElement {
       
       .rssi-bad {
         color: #e74c3c;
+      }
+      
+      .rssi-bar-container {
+        width: 60px;
+        height: 8px;
+        background-color: rgba(0, 0, 0, 0.1);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      
+      .rssi-bar {
+        height: 100%;
+        border-radius: 4px;
+      }
+      
+      .rssi-bar.rssi-good {
+        background-color: #2ecc71;
+      }
+      
+      .rssi-bar.rssi-medium {
+        background-color: #f39c12;
+      }
+      
+      .rssi-bar.rssi-bad {
+        background-color: #e74c3c;
+      }
+      
+      .rssi-percentage {
+        min-width: 40px;
+        text-align: right;
       }
       
       .mac-address {
@@ -742,23 +775,37 @@ class RssiDeviceGrid extends HTMLElement {
     });
   }
 
-  _getRssiClass(rssi) {
+  _getRssiInfo(rssi) {
     // Convert RSSI to number
     const rssiValue = parseInt(rssi, 10);
     
     // If not a valid number, return unknown
     if (isNaN(rssiValue)) {
-      return 'rssi-unknown';
+      return {
+        class: 'rssi-unknown',
+        percentage: 0
+      };
     }
     
+    // Calculate percentage (typical WiFi RSSI range is -30 to -90 dBm)
+    // -30 dBm = 100%, -90 dBm = 0%
+    let percentage = Math.max(0, Math.min(100, ((rssiValue + 90) / 60) * 100));
+    percentage = Math.round(percentage);
+    
     // Classify RSSI
+    let signalClass;
     if (rssiValue >= -60) {
-      return 'rssi-good';
+      signalClass = 'rssi-good';
     } else if (rssiValue >= -75) {
-      return 'rssi-medium';
+      signalClass = 'rssi-medium';
     } else {
-      return 'rssi-bad';
+      signalClass = 'rssi-bad';
     }
+    
+    return {
+      class: signalClass,
+      percentage: percentage
+    };
   }
 
   _updateGrid() {
@@ -793,8 +840,39 @@ class RssiDeviceGrid extends HTMLElement {
           row.appendChild(td);
         } else if (column === 'rssi') {
           const td = document.createElement('td');
-          td.className = `rssi-value ${this._getRssiClass(device.rssi)}`;
-          td.textContent = device.rssi || 'N/A';
+          
+          if (device.rssi && !isNaN(parseInt(device.rssi, 10))) {
+            // Get RSSI info with class and percentage
+            const rssiInfo = this._getRssiInfo(device.rssi);
+            
+            // Create container
+            td.className = `rssi-value ${rssiInfo.class}`;
+            
+            // RSSI value
+            const rssiValue = document.createElement('span');
+            rssiValue.textContent = device.rssi;
+            td.appendChild(rssiValue);
+            
+            // RSSI bar
+            const barContainer = document.createElement('div');
+            barContainer.className = 'rssi-bar-container';
+            
+            const bar = document.createElement('div');
+            bar.className = `rssi-bar ${rssiInfo.class}`;
+            bar.style.width = `${rssiInfo.percentage}%`;
+            barContainer.appendChild(bar);
+            
+            td.appendChild(barContainer);
+            
+            // RSSI percentage
+            const percentage = document.createElement('span');
+            percentage.className = 'rssi-percentage';
+            percentage.textContent = `${rssiInfo.percentage}%`;
+            td.appendChild(percentage);
+          } else {
+            td.textContent = 'N/A';
+          }
+          
           row.appendChild(td);
         } else if (column === 'mac') {
           const td = document.createElement('td');
