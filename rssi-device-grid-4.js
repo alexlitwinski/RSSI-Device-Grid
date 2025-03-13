@@ -1028,14 +1028,3 @@ class RssiDeviceGrid extends HTMLElement {
       }, 3000);
     }
   }
-
-// Register the custom card
-customElements.define('rssi-device-grid', RssiDeviceGrid);
-
-// Information for HACS
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: 'rssi-device-grid',
-  name: 'RSSI Device Grid',
-  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality'
-});
