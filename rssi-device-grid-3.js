@@ -7,8 +7,9 @@
  * - MAC address (from device_tracker attributes)
  * - IP address (from device_tracker attributes)
  * - Reconnect button (calls the Omada service to reconnect the device)
+ * - Added: Reconnect All Weak Signals button (reconnects all devices with signal < 50%)
  * 
- * Version: 1.0.0
+ * Version: 1.1.0
  */
 
 class RssiDeviceGrid extends HTMLElement {
@@ -35,6 +36,10 @@ class RssiDeviceGrid extends HTMLElement {
       column: 'name',
       order: 'asc'
     };
+    
+    // Track reconnection operations
+    this._reconnectingAll = false;
+    this._reconnectQueue = [];
   }
 
   setConfig(config) {
@@ -55,7 +60,9 @@ class RssiDeviceGrid extends HTMLElement {
       show_filter: config.show_filter !== false, // Show filter field by default
       filter_placeholder: config.filter_placeholder || 'Filter devices...',
       sortable_columns: config.sortable_columns || ['name', 'rssi', 'mac', 'ip'], // Columns that can be sorted
-      enable_sorting: config.enable_sorting !== false // Enable sorting by default
+      enable_sorting: config.enable_sorting !== false, // Enable sorting by default
+      weak_signal_threshold: config.weak_signal_threshold || 50, // Threshold for weak signal (percentage)
+      reconnect_all_button: config.reconnect_all_button !== false // Show reconnect all button
     };
     
     // Initialize empty filter
@@ -246,6 +253,7 @@ class RssiDeviceGrid extends HTMLElement {
   }
 
   _throttledUpdate() {
+    // If we're already processing, don't trigger another
     if (this._updateTimerId !== null) {
       clearTimeout(this._updateTimerId);
     }
@@ -253,6 +261,22 @@ class RssiDeviceGrid extends HTMLElement {
     this._updateTimerId = setTimeout(() => {
       this._updateTimerId = null;
       this._updateCard();
+      
+      // Update the reconnect all button state if it exists
+      if (this._cache.elements && this._cache.elements.reconnectAllButton && !this._reconnectingAll) {
+        const weakDevices = this._getWeakSignalDevices();
+        const reconnectAllButton = this._cache.elements.reconnectAllButton;
+        
+        if (weakDevices.length > 0) {
+          reconnectAllButton.disabled = false;
+          reconnectAllButton.innerHTML = 
+            `<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar ${weakDevices.length} sinais fracos`;
+        } else {
+          reconnectAllButton.disabled = false;
+          reconnectAllButton.innerHTML = 
+            `<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos`;
+        }
+      }
     }, 100); // 100ms debounce
   }
 
@@ -281,6 +305,7 @@ class RssiDeviceGrid extends HTMLElement {
         --border-radius: var(--card-border-radius, var(--ha-card-border-radius, 12px));
         --input-text-color: var(--text-color);
         --input-background-color: var(--background-color);
+        --accent-color: var(--card-accent-color, #e74c3c);
       }
       
       ha-card {
@@ -301,12 +326,19 @@ class RssiDeviceGrid extends HTMLElement {
         display: flex;
         align-items: center;
         justify-content: space-between;
+        flex-wrap: wrap;
       }
       
       .header-left {
         display: flex;
         align-items: center;
         flex: 1;
+      }
+      
+      .header-right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
       
       .header-icon {
@@ -457,6 +489,45 @@ class RssiDeviceGrid extends HTMLElement {
         cursor: not-allowed;
       }
       
+      .reconnect-all-button {
+        background-color: #e74c3c;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 14px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        box-shadow: 0 2px 4px rgba(231, 76, 60, 0.3);
+        transition: background-color 0.2s;
+      }
+      
+      .reconnect-all-button:hover {
+        background-color: #c0392b;
+      }
+      
+      .reconnect-all-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      
+      .reconnect-all-button.success {
+        background-color: #2ecc71;
+      }
+      
+      .reconnect-all-button.error {
+        background-color: #e74c3c;
+      }
+      
+      .reconnect-progress {
+        font-size: 12px;
+        font-weight: 400;
+        margin-left: 5px;
+      }
+      
       .empty-message {
         padding: 24px;
         text-align: center;
@@ -589,7 +660,21 @@ class RssiDeviceGrid extends HTMLElement {
       ${this.config.title}
     `;
     
+    const headerRight = document.createElement('div');
+    headerRight.className = 'header-right';
+    
+    // Add reconnect all button if configured
+    if (this.config.reconnect_all_button) {
+      const reconnectAllButton = document.createElement('button');
+      reconnectAllButton.className = 'reconnect-all-button';
+      reconnectAllButton.id = 'reconnect-all-button';
+      reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos';
+      reconnectAllButton.addEventListener('click', () => this._reconnectWeakSignals());
+      headerRight.appendChild(reconnectAllButton);
+    }
+    
     cardHeader.appendChild(headerLeft);
+    cardHeader.appendChild(headerRight);
     card.appendChild(cardHeader);
     
     // Content
@@ -713,6 +798,8 @@ class RssiDeviceGrid extends HTMLElement {
         card,
         gridContainer,
         tbody,
+        reconnectAllButton: this.config.reconnect_all_button ? 
+                           this.shadowRoot.querySelector('#reconnect-all-button') : null,
         filterInput: this.config.show_filter ? cardContent.querySelector('.filter-input') : null
       };
       
@@ -733,9 +820,11 @@ class RssiDeviceGrid extends HTMLElement {
       emptyMessage.innerHTML = messageText;
       cardContent.appendChild(emptyMessage);
       
-      // Store reference for filter input even with no results
+      // Store reference for reconnectAllButton and filter input even with no results
       this._cache.elements = {
         card,
+        reconnectAllButton: this.config.reconnect_all_button ? 
+                           this.shadowRoot.querySelector('#reconnect-all-button') : null,
         filterInput: this.config.show_filter ? cardContent.querySelector('.filter-input') : null
       };
     }
@@ -808,152 +897,137 @@ class RssiDeviceGrid extends HTMLElement {
     };
   }
 
-  _updateGrid() {
-    if (!this._cache.elements.tbody) return;
+  // Find devices with weak signals
+  _getWeakSignalDevices() {
+    if (!this._cache.deviceList || this._cache.deviceList.length === 0) {
+      return [];
+    }
     
-    const tbody = this._cache.elements.tbody;
-    tbody.innerHTML = '';
-    
-    this._cache.deviceList.forEach((device, index) => {
-      const row = document.createElement('tr');
+    return this._cache.deviceList.filter(device => {
+      // Parse RSSI value
+      const rssiValue = parseInt(device.rssi, 10);
+      if (isNaN(rssiValue)) return false;
       
-      // Apply alternating style for rows
-      if (this.config.alternating_rows && index % 2 === 1) {
-        row.className = 'alternate';
-      }
+      // Calculate percentage
+      const percentage = Math.max(0, Math.min(100, ((rssiValue + 90) / 60) * 100));
       
-      this.config.columns_order.forEach(column => {
-        if (column === 'name') {
-          const td = document.createElement('td');
-          
-          // If configured to show state as text
-          if (this.config.state_text) {
-            const stateIndicator = document.createElement('span');
-            stateIndicator.className = `device-state state-${device.state}`;
-            td.appendChild(stateIndicator);
-          }
-          
-          const nameSpan = document.createElement('span');
-          nameSpan.textContent = device.name;
-          td.appendChild(nameSpan);
-          
-          row.appendChild(td);
-        } else if (column === 'rssi') {
-          const td = document.createElement('td');
-          
-          if (device.rssi && !isNaN(parseInt(device.rssi, 10))) {
-            // Get RSSI info with class and percentage
-            const rssiInfo = this._getRssiInfo(device.rssi);
-            
-            // Create container
-            td.className = `rssi-value ${rssiInfo.class}`;
-            
-            // RSSI value
-            const rssiValue = document.createElement('span');
-            rssiValue.textContent = device.rssi;
-            td.appendChild(rssiValue);
-            
-            // RSSI bar
-            const barContainer = document.createElement('div');
-            barContainer.className = 'rssi-bar-container';
-            
-            const bar = document.createElement('div');
-            bar.className = `rssi-bar ${rssiInfo.class}`;
-            bar.style.width = `${rssiInfo.percentage}%`;
-            barContainer.appendChild(bar);
-            
-            td.appendChild(barContainer);
-            
-            // RSSI percentage
-            const percentage = document.createElement('span');
-            percentage.className = 'rssi-percentage';
-            percentage.textContent = `${rssiInfo.percentage}%`;
-            td.appendChild(percentage);
-          } else {
-            td.textContent = 'N/A';
-          }
-          
-          row.appendChild(td);
-        } else if (column === 'mac') {
-          const td = document.createElement('td');
-          td.className = 'mac-address';
-          td.textContent = device.mac;
-          row.appendChild(td);
-        } else if (column === 'ip') {
-          const td = document.createElement('td');
-          td.className = 'ip-address';
-          td.textContent = device.ip || 'N/A';
-          row.appendChild(td);
-        } else if (column === 'actions') {
-          const td = document.createElement('td');
-          
-          const reconnectButton = document.createElement('button');
-          reconnectButton.className = 'reconnect-button';
-          reconnectButton.innerHTML = '<ha-icon icon="mdi:refresh"></ha-icon> Reconnect';
-          reconnectButton.addEventListener('click', () => this._reconnectDevice(device, reconnectButton));
-          
-          td.appendChild(reconnectButton);
-          row.appendChild(td);
-        }
-      });
-      
-      tbody.appendChild(row);
+      // Check if below threshold
+      return percentage < this.config.weak_signal_threshold;
     });
   }
-
-  _reconnectDevice(device, button) {
-    if (!this._hass || !device.mac) return;
+  
+  // Reconnect all devices with weak signals
+  _reconnectWeakSignals() {
+    if (!this._hass || this._reconnectingAll) return;
     
-    const originalButtonText = button.innerHTML;
+    // Find devices with weak signals
+    const weakDevices = this._getWeakSignalDevices();
     
-    // Visual feedback
-    button.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon> Reconnecting...';
-    button.style.backgroundColor = '#0D3880';
-    button.disabled = true;
+    // If no weak devices, nothing to do
+    if (weakDevices.length === 0) {
+      // Flash success message even though nothing was done
+      const reconnectAllButton = this._cache.elements.reconnectAllButton;
+      if (reconnectAllButton) {
+        const originalText = reconnectAllButton.innerHTML;
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon> Nenhum dispositivo com sinal fraco';
+        reconnectAllButton.classList.add('success');
+        
+        setTimeout(() => {
+          reconnectAllButton.innerHTML = originalText;
+          reconnectAllButton.classList.remove('success');
+        }, 3000);
+      }
+      return;
+    }
     
+    // Start reconnection process
+    this._reconnectingAll = true;
+    this._reconnectQueue = [...weakDevices];
+    
+    // Update button state
+    const reconnectAllButton = this._cache.elements.reconnectAllButton;
+    if (reconnectAllButton) {
+      reconnectAllButton.disabled = true;
+      reconnectAllButton.innerHTML = 
+        `<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon> 
+         Reconectando <span class="reconnect-progress">0/${weakDevices.length}</span>`;
+    }
+    
+    // Start processing queue
+    this._processReconnectQueue();
+  }
+  
+  // Process reconnect queue
+  _processReconnectQueue() {
+    // If queue is empty, finish
+    if (this._reconnectQueue.length === 0) {
+      this._finishReconnectAll(true);
+      return;
+    }
+    
+    const device = this._reconnectQueue.shift();
+    const reconnectAllButton = this._cache.elements.reconnectAllButton;
+    
+    // Update progress display
+    if (reconnectAllButton) {
+      const totalDevices = this._getWeakSignalDevices().length;
+      const processed = totalDevices - this._reconnectQueue.length - 1;
+      reconnectAllButton.querySelector('.reconnect-progress').textContent = 
+        `${processed}/${totalDevices}`;
+    }
+    
+    // Format MAC address if needed
     let macAddress = device.mac;
-    
-    // Format MAC if configured
     if (this.config.format_mac) {
       macAddress = macAddress.replace(/:/g, '-').toUpperCase();
     }
     
-    // Parameters for the service
+    // Prepare service parameters
     const params = {};
     params[this.config.mac_param] = macAddress;
     
+    // Call service to reconnect device
     this._hass.callService(
       this.config.service_domain,
       this.config.service_action,
       params
     ).then(() => {
-      button.innerHTML = '<ha-icon icon="mdi:check"></ha-icon> Sent!';
-      button.style.backgroundColor = '#2ecc71';
-      
+      // Wait a short delay before processing next device
       setTimeout(() => {
-        this._restoreButton(button, originalButtonText);
-      }, 3000);
+        this._processReconnectQueue();
+      }, 500);
     }).catch(error => {
       console.error('Error reconnecting device:', error);
-      button.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon> Error!';
-      button.style.backgroundColor = '#e74c3c';
-      
+      // Continue with next device despite error
       setTimeout(() => {
-        this._restoreButton(button, originalButtonText);
-      }, 3000);
+        this._processReconnectQueue();
+      }, 500);
     });
   }
-
-  _restoreButton(button, originalText) {
-    button.innerHTML = originalText;
-    button.disabled = false;
-    button.style.backgroundColor = '#1a4b8c';
+  
+  // Finish reconnect all operation
+  _finishReconnectAll(success) {
+    this._reconnectingAll = false;
+    
+    // Update button state
+    const reconnectAllButton = this._cache.elements.reconnectAllButton;
+    if (reconnectAllButton) {
+      if (success) {
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon> Reconexão completa!';
+        reconnectAllButton.classList.add('success');
+      } else {
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon> Erro na reconexão!';
+        reconnectAllButton.classList.add('error');
+      }
+      
+      // Re-enable button after delay
+      setTimeout(() => {
+        reconnectAllButton.disabled = false;
+        reconnectAllButton.classList.remove('success', 'error');
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos';
+      }, 3000);
+    }
   }
-
-  getCardSize() {
-    return 1 + Math.min(this._cache.deviceList.length, 5);
-  }
-}
 
 // Register the custom card
 customElements.define('rssi-device-grid', RssiDeviceGrid);
