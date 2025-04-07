@@ -1326,44 +1326,58 @@ class RssiDeviceGrid extends HTMLElement {
       }, 3000);
     }
   }
-  
+
   // Método para mostrar as propriedades do dispositivo
-  _showDeviceMoreInfo(deviceId) {
-    if (!deviceId) return;
+_showDeviceMoreInfo(deviceId) {
+  if (!deviceId) return;
+  
+  // Solução mais direta para o Home Assistant: usar window.history.pushState
+  // Isso efetivamente navega para a URL da página do dispositivo
+  try {
+    const url = `/config/devices/device/${deviceId}`;
+    window.history.pushState(null, '', url);
     
-    // Método mais direto usando a navegação do Home Assistant
-    // Esta é a maneira recomendada a partir do HA 2023.11+
-    if (this._hass && this._hass.navigate) {
-      // Método moderno usando a API de navegação
-      try {
-        this._hass.navigate(`/config/devices/device/${deviceId}`);
-        return;
-      } catch (e) {
-        console.error("Erro ao usar o método de navegação:", e);
-      }
-    }
+    // Dispara um evento de navegação para notificar o Home Assistant sobre a mudança de URL
+    const navEvent = new Event('location-changed', {
+      bubbles: true,
+      composed: true
+    });
+    window.dispatchEvent(navEvent);
     
-    // Método alternativo - usar o evento personalizado
+    console.log('Navegação para dispositivo realizada:', deviceId);
+    return;
+  } catch (e) {
+    console.error('Erro durante navegação direta:', e);
+  }
+  
+  // Método alternativo usando a API do Home Assistant
+  if (this._hass && this._hass.navigate) {
     try {
-      this.dispatchEvent(new CustomEvent('hass-more-info', {
-        bubbles: true,
-        composed: true,
-        detail: {
-          entityId: null,
-          deviceId: deviceId
-        }
-      }));
-      console.log('Evento hass-more-info enviado para deviceId:', deviceId);
+      this._hass.navigate(`/config/devices/device/${deviceId}`);
+      console.log('Navegação via hass.navigate realizada:', deviceId);
+      return;
     } catch (e) {
-      console.error("Erro ao enviar evento hass-more-info:", e);
-      
-      // Último recurso - tentar abrir diretamente via URL
-      const hassRoot = document.querySelector('home-assistant');
-      if (hassRoot && hassRoot.hassNavigate) {
-        hassRoot.hassNavigate(`/config/devices/device/${deviceId}`);
-      }
+      console.error('Erro ao usar hass.navigate:', e);
     }
   }
+  
+  // Método alternativo via evento mais-info
+  try {
+    // Documentação oficial do HA recomenda este formato
+    const event = new CustomEvent('hass-more-info', {
+      bubbles: true,
+      composed: true,
+      detail: {
+        entityId: null,
+        deviceId: deviceId
+      }
+    });
+    this.dispatchEvent(event);
+    console.log('Evento hass-more-info enviado para deviceId:', deviceId);
+  } catch (e) {
+    console.error('Erro ao enviar evento hass-more-info:', e);
+  }
+}
   
   getCardSize() {
     return 1 + Math.min(this._cache.deviceList.length, 5);
