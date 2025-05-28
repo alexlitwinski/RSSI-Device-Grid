@@ -2,9 +2,9 @@
  * RSSI Device Grid Card for Home Assistant
  * 
  * This component displays entities with RSSI values and their associated device_tracker information,
- * allowing reconnection of individual devices or all weak signal devices.
+ * allowing reconnection of individual devices or all weak signal devices, and syncing device names.
  * 
- * Optimized Version: 1.2.1
+ * Optimized Version: 1.3.0
  */
 
 class RssiDeviceGrid extends HTMLElement {
@@ -27,8 +27,9 @@ class RssiDeviceGrid extends HTMLElement {
       order: 'asc'
     };
     
-    // Track reconnection operations
+    // Track operations
     this._reconnectingAll = false;
+    this._syncingNames = false;
     this._reconnectQueue = [];
     
     // Text filter
@@ -45,6 +46,7 @@ class RssiDeviceGrid extends HTMLElement {
       service: config.service || 'tplink_omada.reconnect_client',
       service_domain: config.service_domain || 'tplink_omada',
       service_action: config.service_action || 'reconnect_client',
+      sync_service_action: config.sync_service_action || 'sync_device_names', // New config for sync service
       mac_param: config.mac_param || 'mac',
       format_mac: config.format_mac !== false, // Format MAC by default
       columns_order: config.columns_order || ['name', 'rssi', 'mac', 'ip', 'actions'],
@@ -60,6 +62,7 @@ class RssiDeviceGrid extends HTMLElement {
       enable_sorting: config.enable_sorting !== false, // Enable sorting by default
       weak_signal_threshold: config.weak_signal_threshold || 50, // Threshold for weak signal (percentage)
       reconnect_all_button: config.reconnect_all_button !== false, // Show reconnect all button
+      sync_names_button: config.sync_names_button !== false, // Show sync names button
       update_interval: config.update_interval || 5000 // Update interval in milliseconds (5 seconds default)
     };
     
@@ -426,6 +429,7 @@ class RssiDeviceGrid extends HTMLElement {
         display: flex;
         align-items: center;
         gap: 10px;
+        flex-wrap: wrap;
       }
       
       .header-icon {
@@ -604,6 +608,39 @@ class RssiDeviceGrid extends HTMLElement {
         background-color: #e74c3c;
       }
       
+      .sync-names-button {
+        background-color: #3498db;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 14px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        box-shadow: 0 2px 4px rgba(52, 152, 219, 0.3);
+        transition: background-color 0.2s;
+      }
+      
+      .sync-names-button:hover {
+        background-color: #2980b9;
+      }
+      
+      .sync-names-button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      
+      .sync-names-button.success {
+        background-color: #2ecc71;
+      }
+      
+      .sync-names-button.error {
+        background-color: #e74c3c;
+      }
+      
       .empty-message, .no-results {
         padding: 24px;
         text-align: center;
@@ -712,6 +749,24 @@ class RssiDeviceGrid extends HTMLElement {
       .clickable-row:hover {
         background-color: rgba(var(--rgb-primary-color, 0, 140, 255), 0.1);
       }
+      
+      /* Responsive header buttons */
+      @media (max-width: 768px) {
+        .header-right {
+          gap: 8px;
+        }
+        
+        .reconnect-all-button,
+        .sync-names-button {
+          padding: 6px 10px;
+          font-size: 12px;
+        }
+        
+        .reconnect-all-button span,
+        .sync-names-button span {
+          display: none;
+        }
+      }
     `;
     
     this.shadowRoot.appendChild(style);
@@ -739,12 +794,25 @@ class RssiDeviceGrid extends HTMLElement {
     const headerRight = document.createElement('div');
     headerRight.className = 'header-right';
     
+    // Add sync names button if configured
+    if (this.config.sync_names_button) {
+      const syncNamesButton = document.createElement('button');
+      syncNamesButton.className = 'sync-names-button';
+      syncNamesButton.id = 'sync-names-button';
+      syncNamesButton.innerHTML = '<ha-icon icon="mdi:sync"></ha-icon><span> Sincronizar nomes</span>';
+      syncNamesButton.addEventListener('click', () => this._syncDeviceNames());
+      headerRight.appendChild(syncNamesButton);
+      
+      // Store reference to button
+      this._elements.syncNamesButton = syncNamesButton;
+    }
+    
     // Add reconnect all button if configured
     if (this.config.reconnect_all_button) {
       const reconnectAllButton = document.createElement('button');
       reconnectAllButton.className = 'reconnect-all-button';
       reconnectAllButton.id = 'reconnect-all-button';
-      reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos';
+      reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon><span> Reconectar sinais fracos</span>';
       reconnectAllButton.addEventListener('click', () => this._reconnectWeakSignals());
       headerRight.appendChild(reconnectAllButton);
       
@@ -1152,11 +1220,58 @@ class RssiDeviceGrid extends HTMLElement {
     
     if (weakDevicesCount > 0) {
       button.disabled = false;
-      button.innerHTML = `<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar ${weakDevicesCount} sinais fracos`;
+      button.innerHTML = `<ha-icon icon="mdi:wifi-refresh"></ha-icon><span> Reconectar ${weakDevicesCount} sinais fracos</span>`;
     } else {
       button.disabled = false;
-      button.innerHTML = `<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos`;
+      button.innerHTML = `<ha-icon icon="mdi:wifi-refresh"></ha-icon><span> Reconectar sinais fracos</span>`;
     }
+  }
+  
+  /* --- Device Names Synchronization --- */
+  
+  // Sync device names from Omada controller
+  _syncDeviceNames() {
+    if (!this._hass || this._syncingNames) return;
+    
+    this._syncingNames = true;
+    const syncButton = this._elements.syncNamesButton;
+    
+    if (syncButton) {
+      const originalText = syncButton.innerHTML;
+      syncButton.disabled = true;
+      syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Sincronizando...</span>';
+      
+      // Call the sync service
+      this._hass.callService(
+        this.config.service_domain,
+        this.config.sync_service_action,
+        {} // No parameters needed for sync operation
+      ).then(() => {
+        // Success
+        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Nomes sincronizados!</span>';
+        syncButton.classList.add('success');
+        
+        setTimeout(() => {
+          this._restoreSyncButton(syncButton, originalText);
+        }, 3000);
+      }).catch(error => {
+        // Error
+        console.error('Error syncing device names:', error);
+        syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Erro na sincronização!</span>';
+        syncButton.classList.add('error');
+        
+        setTimeout(() => {
+          this._restoreSyncButton(syncButton, originalText);
+        }, 3000);
+      });
+    }
+  }
+  
+  _restoreSyncButton(button, originalText) {
+    this._syncingNames = false;
+    button.innerHTML = originalText;
+    button.disabled = false;
+    button.classList.remove('success', 'error');
   }
   
   /* --- Device Reconnection --- */
@@ -1224,7 +1339,7 @@ class RssiDeviceGrid extends HTMLElement {
       const reconnectAllButton = this._elements.reconnectAllButton;
       if (reconnectAllButton) {
         const originalText = reconnectAllButton.innerHTML;
-        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon> Nenhum dispositivo com sinal fraco';
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Nenhum dispositivo com sinal fraco</span>';
         reconnectAllButton.classList.add('success');
         
         setTimeout(() => {
@@ -1244,8 +1359,8 @@ class RssiDeviceGrid extends HTMLElement {
     if (reconnectAllButton) {
       reconnectAllButton.disabled = true;
       reconnectAllButton.innerHTML = 
-        `<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon> 
-         Reconectando <span class="reconnect-progress">0/${weakDevices.length}</span>`;
+        `<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> 
+         Reconectando <span class="reconnect-progress">0/${weakDevices.length}</span></span>`;
     }
     
     // Start processing queue
@@ -1311,10 +1426,10 @@ class RssiDeviceGrid extends HTMLElement {
     const reconnectAllButton = this._elements.reconnectAllButton;
     if (reconnectAllButton) {
       if (success) {
-        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon> Reconexão completa!';
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Reconexão completa!</span>';
         reconnectAllButton.classList.add('success');
       } else {
-        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon> Erro na reconexão!';
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Erro na reconexão!</span>';
         reconnectAllButton.classList.add('error');
       }
       
@@ -1322,7 +1437,7 @@ class RssiDeviceGrid extends HTMLElement {
       setTimeout(() => {
         reconnectAllButton.disabled = false;
         reconnectAllButton.classList.remove('success', 'error');
-        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon> Reconectar sinais fracos';
+        reconnectAllButton.innerHTML = '<ha-icon icon="mdi:wifi-refresh"></ha-icon><span> Reconectar sinais fracos</span>';
       }, 3000);
     }
   }
@@ -1392,5 +1507,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'rssi-device-grid',
   name: 'RSSI Device Grid',
-  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality - Optimized Version'
+  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality and name sync - Optimized Version'
 });
