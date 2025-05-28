@@ -3,9 +3,9 @@
  * 
  * This component displays entities with RSSI values and their associated device_tracker information,
  * allowing reconnection of individual devices or all weak signal devices, and syncing device names
- * directly with Omada Controller.
+ * directly with Omada Controller with automatic entity name updates.
  * 
- * Version: 1.3.0 - Direct Omada Integration
+ * Version: 1.3.0 - Direct Omada Integration with Name Updates
  */
 
 class RssiDeviceGrid extends HTMLElement {
@@ -80,7 +80,8 @@ class RssiDeviceGrid extends HTMLElement {
       omada_username: config.omada_username || '',
       omada_password: config.omada_password || '',
       omada_site: config.omada_site || 'Default',
-      omada_verify_ssl: config.omada_verify_ssl !== false
+      omada_verify_ssl: config.omada_verify_ssl !== false,
+      omada_update_ha_names: config.omada_update_ha_names !== false // NEW: Actually update entity names in HA
     };
     
     // Set initial sort state based on configuration
@@ -325,7 +326,7 @@ class RssiDeviceGrid extends HTMLElement {
             return retryData.result.data || [];
           }
         }
-        throw new Error(`Failed to get clients: ${response.status}`);
+        throw new Error(`Failed to get clients: ${response.status} ${response.statusText}`);
       }
       
       const data = await response.json();
@@ -334,7 +335,8 @@ class RssiDeviceGrid extends HTMLElement {
         throw new Error(`API error: ${data.msg || 'Unknown error'}`);
       }
       
-      console.log(`Retrieved ${data.result.data.length} clients from Omada Controller`);
+      const clientsCount = data.result.data ? data.result.data.length : 0;
+      console.log(`Retrieved ${clientsCount} clients from Omada Controller`);
       return data.result.data || [];
       
     } catch (error) {
@@ -362,17 +364,19 @@ class RssiDeviceGrid extends HTMLElement {
         }
       });
       
-      // Compare with current Home Assistant devices
+      // Compare with current Home Assistant devices and prepare updates
       const updates = [];
       const currentDevices = this._cache.deviceList;
       
-      currentDevices.forEach(device => {
+      for (const device of currentDevices) {
         if (device.mac) {
           const normalizedMac = device.mac.toLowerCase().replace(/[:-]/g, '');
           const omadaDevice = omadaNames.get(normalizedMac);
           
           if (omadaDevice && omadaDevice.name !== device.name) {
             updates.push({
+              entityId: device.entity_id,
+              trackerId: device.tracker_entity_id,
               mac: device.mac,
               currentName: device.name,
               omadaName: omadaDevice.name,
@@ -381,7 +385,7 @@ class RssiDeviceGrid extends HTMLElement {
             });
           }
         }
-      });
+      }
       
       return {
         totalOmadaDevices: omadaClients.length,
@@ -392,6 +396,92 @@ class RssiDeviceGrid extends HTMLElement {
     } catch (error) {
       console.error('Error syncing with Omada:', error);
       throw error;
+    }
+  }
+  
+  async _updateEntityNamesInHA(updates) {
+    if (!updates || updates.length === 0) {
+      return { updated: 0, errors: [] };
+    }
+    
+    let updated = 0;
+    const errors = [];
+    
+    for (const update of updates) {
+      try {
+        // Update RSSI entity friendly name
+        if (update.entityId) {
+          await this._updateEntityFriendlyName(update.entityId, `${update.omadaName} RSSI`);
+          console.log(`Updated RSSI entity ${update.entityId}: "${update.currentName}" -> "${update.omadaName} RSSI"`);
+        }
+        
+        // Update device tracker friendly name
+        if (update.trackerId) {
+          await this._updateEntityFriendlyName(update.trackerId, update.omadaName);
+          console.log(`Updated tracker entity ${update.trackerId}: "${update.currentName}" -> "${update.omadaName}"`);
+        }
+        
+        updated++;
+        
+      } catch (error) {
+        console.error(`Failed to update entity names for ${update.mac}:`, error);
+        errors.push({
+          mac: update.mac,
+          error: error.message
+        });
+      }
+    }
+    
+    return { updated, errors };
+  }
+  
+  async _updateEntityFriendlyName(entityId, newName) {
+    if (!this._hass || !entityId || !newName) {
+      throw new Error('Missing required parameters for entity update');
+    }
+    
+    try {
+      // Method 1: Try using entity registry service (Home Assistant 2023.7+)
+      await this._hass.callService('homeassistant', 'update_entity', {
+        entity_id: entityId,
+        name: newName
+      });
+      
+    } catch (error) {
+      console.warn(`Method 1 failed for ${entityId}, trying method 2:`, error);
+      
+      try {
+        // Method 2: Try using the REST API directly
+        const response = await fetch('/api/config/entity_registry/' + entityId, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this._hass.auth.accessToken}`
+          },
+          body: JSON.stringify({
+            name: newName
+          })
+        });
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+      } catch (restError) {
+        console.warn(`Method 2 failed for ${entityId}, trying method 3:`, restError);
+        
+        try {
+          // Method 3: Try using entity customization (fallback)
+          await this._hass.callService('homeassistant', 'set_entity_customization', {
+            entity_id: entityId,
+            friendly_name: newName
+          });
+          
+        } catch (customError) {
+          console.error(`All methods failed for ${entityId}:`, customError);
+          throw new Error(`Failed to update entity name: ${customError.message}`);
+        }
+      }
     }
   }
   
@@ -848,6 +938,34 @@ class RssiDeviceGrid extends HTMLElement {
       
       .sync-names-button.error {
         background-color: #e74c3c;
+      }
+      
+      .progress-container {
+        margin-top: 10px;
+        padding: 8px 0;
+      }
+      
+      .progress-bar {
+        width: 100%;
+        height: 6px;
+        background-color: rgba(0, 0, 0, 0.1);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      
+      .progress-fill {
+        height: 100%;
+        background-color: #3498db;
+        border-radius: 3px;
+        transition: width 0.3s ease;
+        width: 0%;
+      }
+      
+      .progress-text {
+        font-size: 12px;
+        color: var(--secondary-text-color);
+        margin-top: 4px;
+        text-align: center;
       }
       
       .empty-message, .no-results {
@@ -1447,129 +1565,242 @@ class RssiDeviceGrid extends HTMLElement {
     
     if (syncButton) {
       const originalText = syncButton.innerHTML;
-      syncButton.disabled = true;
-      syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Sincronizando...</span>';
       
-      // Try direct Omada connection first if configured
+      // Create progress container
+      const progressContainer = this._createProgressContainer();
+      syncButton.parentNode.insertBefore(progressContainer, syncButton.nextSibling);
+      
+      // Check if Omada is configured
       if (this.config.omada_controller_url && this.config.omada_username && this.config.omada_password) {
-        this._syncWithOmadaController(syncButton, originalText);
+        this._updateProgress(progressContainer, 0, 'Conectando ao Omada Controller...');
+        syncButton.disabled = true;
+        syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Conectando...</span>';
+        
+        this._syncWithOmadaController(syncButton, originalText, progressContainer);
       } else {
-        // Fallback to service calls and integration reload
-        this._syncWithFallback(syncButton, originalText);
+        this._updateProgress(progressContainer, 0, 'Omada não configurado. Usando método alternativo...');
+        syncButton.disabled = true;
+        syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Atualizando...</span>';
+        
+        // Go directly to integration reload since Omada is not configured
+        this._syncWithIntegrationReload(syncButton, originalText, progressContainer);
       }
     }
   }
   
-  async _syncWithOmadaController(syncButton, originalText) {
+  _createProgressContainer() {
+    const container = document.createElement('div');
+    container.className = 'progress-container';
+    container.style.display = 'none';
+    
+    const progressBar = document.createElement('div');
+    progressBar.className = 'progress-bar';
+    
+    const progressFill = document.createElement('div');
+    progressFill.className = 'progress-fill';
+    progressBar.appendChild(progressFill);
+    
+    const progressText = document.createElement('div');
+    progressText.className = 'progress-text';
+    progressText.textContent = 'Iniciando...';
+    
+    container.appendChild(progressBar);
+    container.appendChild(progressText);
+    
+    return container;
+  }
+  
+  _updateProgress(container, percentage, text) {
+    if (!container) return;
+    
+    container.style.display = 'block';
+    const progressFill = container.querySelector('.progress-fill');
+    const progressText = container.querySelector('.progress-text');
+    
+    if (progressFill) {
+      progressFill.style.width = `${Math.max(0, Math.min(100, percentage))}%`;
+    }
+    
+    if (progressText) {
+      progressText.textContent = text;
+    }
+  }
+  
+  _removeProgress(container) {
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+    }
+  }
+  
+  async _syncWithOmadaController(syncButton, originalText, progressContainer) {
     try {
+      this._updateProgress(progressContainer, 20, 'Autenticando com Omada...');
+      await new Promise(resolve => setTimeout(resolve, 500)); // Small delay for visual feedback
+      
+      this._updateProgress(progressContainer, 40, 'Buscando dispositivos do Omada...');
       const syncResult = await this._syncDeviceNamesWithOmada();
       
+      this._updateProgress(progressContainer, 60, 'Comparando nomes dos dispositivos...');
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
       if (syncResult.foundUpdates > 0) {
-        // Show detailed results
-        console.log('Name sync results:', syncResult);
-        
-        // Display results to user
-        let message = `Encontradas ${syncResult.foundUpdates} diferenças de nomes:`;
-        syncResult.updates.forEach(update => {
-          console.log(`${update.mac}: "${update.currentName}" -> "${update.omadaName}"`);
-          message += `\n• ${update.currentName} -> ${update.omadaName}`;
-        });
-        
-        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Sincronização completa!</span>';
-        syncButton.classList.add('success');
-        
-        // Show notification with details
-        this._showNotification(`Sincronização do Omada: ${syncResult.foundUpdates} diferenças encontradas. Verifique o console para detalhes.`, 'success');
+        // Check if user wants to actually update names in HA
+        if (this.config.omada_update_ha_names) {
+          this._updateProgress(progressContainer, 80, `Atualizando ${syncResult.foundUpdates} nomes no Home Assistant...`);
+          
+          // Actually update the entity names in Home Assistant
+          const updateResult = await this._updateEntityNamesInHA(syncResult.updates);
+          
+          this._updateProgress(progressContainer, 100, 'Sincronização e atualização concluídas!');
+          
+          // Show detailed results
+          console.log('Name sync results:', syncResult);
+          console.log('Update results:', updateResult);
+          
+          // Display results to user
+          let message = `Atualizados ${updateResult.updated} de ${syncResult.foundUpdates} dispositivos:`;
+          syncResult.updates.forEach(update => {
+            console.log(`${update.mac}: "${update.currentName}" -> "${update.omadaName}" (UPDATED IN HA)`);
+          });
+          
+          if (updateResult.errors.length > 0) {
+            console.warn('Errors during update:', updateResult.errors);
+            message += `\n⚠️ ${updateResult.errors.length} erros durante atualização.`;
+          }
+          
+          syncButton.innerHTML = '<ha-icon icon="mdi:check-circle"></ha-icon><span> Nomes atualizados no HA!</span>';
+          syncButton.classList.add('success');
+          
+          // Show notification with details
+          this._showNotification(`✅ Omada Sync: ${updateResult.updated} nomes ATUALIZADOS no HA de ${syncResult.totalOmadaDevices} dispositivos. ${updateResult.errors.length > 0 ? updateResult.errors.length + ' erros.' : 'Sucesso total!'} Verifique o console (F12) para detalhes.`);
+          
+          // Force refresh the card to show updated names
+          setTimeout(() => {
+            this._throttledRender();
+          }, 1000);
+          
+        } else {
+          // Just compare, don't update
+          this._updateProgress(progressContainer, 100, 'Comparação concluída (sem atualização)!');
+          
+          // Show detailed results
+          console.log('Name sync results (COMPARISON ONLY):', syncResult);
+          
+          // Display results to user
+          let message = `Encontradas ${syncResult.foundUpdates} diferenças de nomes (APENAS COMPARAÇÃO):`;
+          syncResult.updates.forEach(update => {
+            console.log(`${update.mac}: "${update.currentName}" -> "${update.omadaName}" (NOT UPDATED)`);
+          });
+          
+          syncButton.innerHTML = '<ha-icon icon="mdi:check-circle"></ha-icon><span> Comparação completa!</span>';
+          syncButton.classList.add('success');
+          
+          // Show notification with details
+          this._showNotification(`ℹ️ Omada Sync: ${syncResult.foundUpdates} diferenças ENCONTRADAS de ${syncResult.totalOmadaDevices} dispositivos. Configure 'omada_update_ha_names: true' para atualizar automaticamente. Verifique o console (F12) para detalhes.`);
+        }
         
       } else {
-        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Nomes já sincronizados!</span>';
+        this._updateProgress(progressContainer, 100, 'Nenhuma atualização necessária!');
+        
+        syncButton.innerHTML = '<ha-icon icon="mdi:check-circle"></ha-icon><span> Nomes já sincronizados!</span>';
         syncButton.classList.add('success');
         
-        this._showNotification(`Todos os ${syncResult.totalOmadaDevices} dispositivos já estão com nomes atualizados.`, 'success');
+        this._showNotification(`✅ Todos os ${syncResult.totalOmadaDevices} dispositivos já estão com nomes atualizados no Omada.`);
       }
       
       setTimeout(() => {
-        this._restoreSyncButton(syncButton, originalText);
-      }, 5000);
+        this._restoreSyncButton(syncButton, originalText, progressContainer);
+      }, 4000);
       
     } catch (error) {
       console.error('Omada sync failed:', error);
-      syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Erro na conexão Omada!</span>';
+      this._updateProgress(progressContainer, 100, `Erro: ${error.message}`);
+      
+      syncButton.innerHTML = '<ha-icon icon="mdi:alert-circle"></ha-icon><span> Erro na conexão Omada!</span>';
       syncButton.classList.add('error');
       
-      this._showNotification(`Erro ao conectar com Omada: ${error.message}`, 'error');
+      this._showNotification(`❌ Erro ao conectar com Omada: ${error.message}`);
       
       setTimeout(() => {
-        // Try fallback method
-        this._syncWithFallback(syncButton, originalText);
+        this._updateProgress(progressContainer, 0, 'Tentando método alternativo...');
+        this._syncWithIntegrationReload(syncButton, originalText, progressContainer);
       }, 2000);
     }
   }
   
-  _syncWithFallback(syncButton, originalText) {
-    const serviceName = `${this.config.service_domain}.${this.config.sync_service_action}`;
+  _syncWithIntegrationReload(syncButton, originalText, progressContainer) {
+    this._updateProgress(progressContainer, 20, 'Procurando integração TP-Link Omada...');
     
-    this._hass.callService(
-      this.config.service_domain,
-      this.config.sync_service_action,
-      {}
-    ).then(() => {
-      syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Atualizado com sucesso!</span>';
-      syncButton.classList.add('success');
+    if (this._hass.config_entries) {
+      const omadaEntry = Object.values(this._hass.config_entries).find(entry => 
+        entry.domain === this.config.service_domain);
       
-      setTimeout(() => {
-        this._restoreSyncButton(syncButton, originalText);
-      }, 3000);
-    }).catch(error => {
-      console.error(`Error calling service ${serviceName}:`, error);
-      
-      // Try to reload integration
-      if (this._hass.config_entries) {
-        const omadaEntry = Object.values(this._hass.config_entries).find(entry => 
-          entry.domain === this.config.service_domain);
+      if (omadaEntry) {
+        this._updateProgress(progressContainer, 40, 'Recarregando integração...');
+        syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Recarregando integração...</span>';
         
-        if (omadaEntry) {
-          this._hass.callService('homeassistant', 'reload_config_entry', {
-            entry_id: omadaEntry.entry_id
-          }).then(() => {
-            syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Integração recarregada!</span>';
-            syncButton.classList.add('success');
-            
-            setTimeout(() => {
-              this._restoreSyncButton(syncButton, originalText);
-            }, 3000);
-          }).catch(() => {
-            // Final fallback: just refresh the card
-            syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Card atualizado!</span>';
+        this._hass.callService('homeassistant', 'reload_config_entry', {
+          entry_id: omadaEntry.entry_id
+        }).then(() => {
+          this._updateProgress(progressContainer, 100, 'Integração recarregada com sucesso!');
+          
+          syncButton.innerHTML = '<ha-icon icon="mdi:check-circle"></ha-icon><span> Integração recarregada!</span>';
+          syncButton.classList.add('success');
+          
+          this._showNotification('✅ Integração TP-Link Omada recarregada com sucesso.');
+          
+          setTimeout(() => {
+            this._restoreSyncButton(syncButton, originalText, progressContainer);
+          }, 3000);
+        }).catch((error) => {
+          console.error('Error reloading integration:', error);
+          this._updateProgress(progressContainer, 60, 'Erro ao recarregar. Tentando atualizar card...');
+          
+          // Final fallback: just refresh the card
+          setTimeout(() => {
+            this._updateProgress(progressContainer, 100, 'Card atualizado!');
+            syncButton.innerHTML = '<ha-icon icon="mdi:refresh"></ha-icon><span> Card atualizado!</span>';
             syncButton.classList.add('success');
             this._throttledRender();
             
+            this._showNotification('ℹ️ Card atualizado. Integração pode não ter sido recarregada.');
+            
             setTimeout(() => {
-              this._restoreSyncButton(syncButton, originalText);
+              this._restoreSyncButton(syncButton, originalText, progressContainer);
             }, 3000);
-          });
-        } else {
-          // Just refresh the card
-          syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Card atualizado!</span>';
+          }, 1000);
+        });
+      } else {
+        this._updateProgress(progressContainer, 60, 'Integração não encontrada. Atualizando card...');
+        
+        // Just refresh the card
+        setTimeout(() => {
+          this._updateProgress(progressContainer, 100, 'Card atualizado!');
+          syncButton.innerHTML = '<ha-icon icon="mdi:refresh"></ha-icon><span> Card atualizado!</span>';
           syncButton.classList.add('success');
           this._throttledRender();
           
+          this._showNotification('ℹ️ Card atualizado. Configure conexão direta com Omada para melhor funcionalidade.');
+          
           setTimeout(() => {
-            this._restoreSyncButton(syncButton, originalText);
+            this._restoreSyncButton(syncButton, originalText, progressContainer);
           }, 3000);
-        }
-      } else {
-        syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Serviço não encontrado!</span>';
-        syncButton.classList.add('error');
-        
-        setTimeout(() => {
-          this._restoreSyncButton(syncButton, originalText);
-        }, 3000);
+        }, 1000);
       }
-    });
+    } else {
+      this._updateProgress(progressContainer, 100, 'Erro: Sistema não suportado');
+      syncButton.innerHTML = '<ha-icon icon="mdi:alert-circle"></ha-icon><span> Sistema não suportado!</span>';
+      syncButton.classList.add('error');
+      
+      this._showNotification('❌ Não foi possível acessar as configurações do Home Assistant.');
+      
+      setTimeout(() => {
+        this._restoreSyncButton(syncButton, originalText, progressContainer);
+      }, 3000);
+    }
   }
   
-  _showNotification(message, type = 'info') {
+  _showNotification(message) {
     if (this._hass && this._hass.callService) {
       this._hass.callService('persistent_notification', 'create', {
         message: message,
@@ -1578,15 +1809,22 @@ class RssiDeviceGrid extends HTMLElement {
       });
     } else {
       // Fallback to console
-      console.log(`[${type.toUpperCase()}] ${message}`);
+      console.log(`[RSSI Device Grid] ${message}`);
     }
   }
   
-  _restoreSyncButton(button, originalText) {
+  _restoreSyncButton(button, originalText, progressContainer = null) {
     this._syncingNames = false;
     button.innerHTML = originalText;
     button.disabled = false;
     button.classList.remove('success', 'error');
+    
+    // Remove progress container after a delay
+    if (progressContainer) {
+      setTimeout(() => {
+        this._removeProgress(progressContainer);
+      }, 1000);
+    }
   }
   
   /* --- Device Reconnection --- */
@@ -1822,5 +2060,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'rssi-device-grid',
   name: 'RSSI Device Grid',
-  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality and direct Omada name sync - Optimized Version'
+  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality and automatic Omada name sync - Version 1.3.0'
 });
