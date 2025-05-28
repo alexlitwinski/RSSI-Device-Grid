@@ -2,9 +2,10 @@
  * RSSI Device Grid Card for Home Assistant
  * 
  * This component displays entities with RSSI values and their associated device_tracker information,
- * allowing reconnection of individual devices or all weak signal devices, and syncing device names.
+ * allowing reconnection of individual devices or all weak signal devices, and syncing device names
+ * directly with Omada Controller.
  * 
- * Optimized Version: 1.3.0
+ * Version: 1.3.0 - Direct Omada Integration
  */
 
 class RssiDeviceGrid extends HTMLElement {
@@ -38,6 +39,15 @@ class RssiDeviceGrid extends HTMLElement {
     
     // Card elements
     this._elements = {};
+    
+    // Omada Controller direct connection cache
+    this._omadaConnection = {
+      authenticated: false,
+      controllerId: null,
+      token: null,
+      lastLogin: null,
+      sessionTimeout: 3600000 // 1 hour
+    };
   }
 
   setConfig(config) {
@@ -46,7 +56,7 @@ class RssiDeviceGrid extends HTMLElement {
       service: config.service || 'tplink_omada.reconnect_client',
       service_domain: config.service_domain || 'tplink_omada',
       service_action: config.service_action || 'reconnect_client',
-      sync_service_action: config.sync_service_action || 'sync_device_names', // New config for sync service
+      sync_service_action: config.sync_service_action || 'update_entities', // Service for refreshing entities
       mac_param: config.mac_param || 'mac',
       format_mac: config.format_mac !== false, // Format MAC by default
       columns_order: config.columns_order || ['name', 'rssi', 'mac', 'ip', 'actions'],
@@ -62,8 +72,15 @@ class RssiDeviceGrid extends HTMLElement {
       enable_sorting: config.enable_sorting !== false, // Enable sorting by default
       weak_signal_threshold: config.weak_signal_threshold || 50, // Threshold for weak signal (percentage)
       reconnect_all_button: config.reconnect_all_button !== false, // Show reconnect all button
-      sync_names_button: config.sync_names_button !== false, // Show sync names button
-      update_interval: config.update_interval || 5000 // Update interval in milliseconds (5 seconds default)
+      sync_names_button: config.sync_names_button === true, // Show sync names button (disabled by default)
+      update_interval: config.update_interval || 5000, // Update interval in milliseconds (5 seconds default)
+      
+      // NEW: Direct Omada Controller connection settings (optional)
+      omada_controller_url: config.omada_controller_url || '',
+      omada_username: config.omada_username || '',
+      omada_password: config.omada_password || '',
+      omada_site: config.omada_site || 'Default',
+      omada_verify_ssl: config.omada_verify_ssl !== false
     };
     
     // Set initial sort state based on configuration
@@ -184,6 +201,198 @@ class RssiDeviceGrid extends HTMLElement {
     return text.toString().normalize('NFD')
               .replace(/[\u0300-\u036f]/g, '')
               .toLowerCase();
+  }
+  
+  /* --- Direct Omada Controller Connection --- */
+  
+  async _connectToOmada() {
+    if (!this.config.omada_controller_url || !this.config.omada_username || !this.config.omada_password) {
+      console.warn('Omada Controller connection not configured');
+      return false;
+    }
+    
+    // Check if we have a valid session
+    if (this._omadaConnection.authenticated && 
+        this._omadaConnection.lastLogin && 
+        (Date.now() - this._omadaConnection.lastLogin) < this._omadaConnection.sessionTimeout) {
+      return true;
+    }
+    
+    try {
+      console.log('Connecting to Omada Controller...');
+      
+      // Step 1: Get Controller ID
+      const infoUrl = `${this.config.omada_controller_url}/api/info`;
+      const infoResponse = await fetch(infoUrl, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!infoResponse.ok) {
+        throw new Error(`Failed to get controller info: ${infoResponse.status} ${infoResponse.statusText}`);
+      }
+      
+      const infoData = await infoResponse.json();
+      if (!infoData.result || !infoData.result.omadacId) {
+        throw new Error('Invalid controller info response');
+      }
+      
+      this._omadaConnection.controllerId = infoData.result.omadacId;
+      console.log('Got controller ID:', this._omadaConnection.controllerId);
+      
+      // Step 2: Login
+      const loginUrl = `${this.config.omada_controller_url}/${this._omadaConnection.controllerId}/api/v2/login`;
+      const loginResponse = await fetch(loginUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          username: this.config.omada_username,
+          password: this.config.omada_password
+        })
+      });
+      
+      if (!loginResponse.ok) {
+        throw new Error(`Login failed: ${loginResponse.status} ${loginResponse.statusText}`);
+      }
+      
+      const loginData = await loginResponse.json();
+      
+      if (loginData.errorCode !== 0) {
+        throw new Error(`Login error: ${loginData.msg || 'Unknown error'}`);
+      }
+      
+      this._omadaConnection.token = loginData.result.token;
+      this._omadaConnection.authenticated = true;
+      this._omadaConnection.lastLogin = Date.now();
+      
+      console.log('Successfully connected to Omada Controller');
+      return true;
+      
+    } catch (error) {
+      console.error('Failed to connect to Omada Controller:', error);
+      this._omadaConnection.authenticated = false;
+      return false;
+    }
+  }
+  
+  async _getOmadaDeviceNames() {
+    if (!await this._connectToOmada()) {
+      throw new Error('Failed to connect to Omada Controller');
+    }
+    
+    try {
+      // Get clients from Omada Controller
+      const clientsUrl = `${this.config.omada_controller_url}/${this._omadaConnection.controllerId}/api/v2/sites/${this.config.omada_site}/clients?currentPage=1&currentPageSize=1000`;
+      
+      const response = await fetch(clientsUrl, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Csrf-Token': this._omadaConnection.token
+        },
+        credentials: 'include'
+      });
+      
+      if (!response.ok) {
+        // Try to reconnect on authentication errors
+        if (response.status === 401 || response.status === 403) {
+          this._omadaConnection.authenticated = false;
+          if (await this._connectToOmada()) {
+            // Retry with new token
+            const retryResponse = await fetch(clientsUrl, {
+              method: 'GET',
+              headers: {
+                'Content-Type': 'application/json',
+                'Csrf-Token': this._omadaConnection.token
+              },
+              credentials: 'include'
+            });
+            
+            if (!retryResponse.ok) {
+              throw new Error(`Failed to get clients after retry: ${retryResponse.status}`);
+            }
+            
+            const retryData = await retryResponse.json();
+            if (retryData.errorCode !== 0) {
+              throw new Error(`API error after retry: ${retryData.msg}`);
+            }
+            
+            return retryData.result.data || [];
+          }
+        }
+        throw new Error(`Failed to get clients: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      if (data.errorCode !== 0) {
+        throw new Error(`API error: ${data.msg || 'Unknown error'}`);
+      }
+      
+      console.log(`Retrieved ${data.result.data.length} clients from Omada Controller`);
+      return data.result.data || [];
+      
+    } catch (error) {
+      console.error('Error getting Omada device names:', error);
+      throw error;
+    }
+  }
+  
+  async _syncDeviceNamesWithOmada() {
+    try {
+      const omadaClients = await this._getOmadaDeviceNames();
+      
+      // Create a map of MAC addresses to names from Omada
+      const omadaNames = new Map();
+      omadaClients.forEach(client => {
+        if (client.mac && (client.name || client.hostName)) {
+          // Normalize MAC address for comparison
+          const normalizedMac = client.mac.toLowerCase().replace(/[:-]/g, '');
+          omadaNames.set(normalizedMac, {
+            name: client.name || client.hostName,
+            ip: client.ip,
+            ssid: client.ssid,
+            originalMac: client.mac
+          });
+        }
+      });
+      
+      // Compare with current Home Assistant devices
+      const updates = [];
+      const currentDevices = this._cache.deviceList;
+      
+      currentDevices.forEach(device => {
+        if (device.mac) {
+          const normalizedMac = device.mac.toLowerCase().replace(/[:-]/g, '');
+          const omadaDevice = omadaNames.get(normalizedMac);
+          
+          if (omadaDevice && omadaDevice.name !== device.name) {
+            updates.push({
+              mac: device.mac,
+              currentName: device.name,
+              omadaName: omadaDevice.name,
+              ip: omadaDevice.ip,
+              ssid: omadaDevice.ssid
+            });
+          }
+        }
+      });
+      
+      return {
+        totalOmadaDevices: omadaClients.length,
+        foundUpdates: updates.length,
+        updates: updates
+      };
+      
+    } catch (error) {
+      console.error('Error syncing with Omada:', error);
+      throw error;
+    }
   }
   
   /* --- Device Data Management --- */
@@ -1229,7 +1438,7 @@ class RssiDeviceGrid extends HTMLElement {
   
   /* --- Device Names Synchronization --- */
   
-  // Sync device names from Omada controller
+  // Sync device names from Omada controller OR refresh entities
   _syncDeviceNames() {
     if (!this._hass || this._syncingNames) return;
     
@@ -1241,29 +1450,135 @@ class RssiDeviceGrid extends HTMLElement {
       syncButton.disabled = true;
       syncButton.innerHTML = '<ha-icon icon="mdi:loading" class="loading-icon"></ha-icon><span> Sincronizando...</span>';
       
-      // Call the sync service
-      this._hass.callService(
-        this.config.service_domain,
-        this.config.sync_service_action,
-        {} // No parameters needed for sync operation
-      ).then(() => {
-        // Success
-        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Nomes sincronizados!</span>';
+      // Try direct Omada connection first if configured
+      if (this.config.omada_controller_url && this.config.omada_username && this.config.omada_password) {
+        this._syncWithOmadaController(syncButton, originalText);
+      } else {
+        // Fallback to service calls and integration reload
+        this._syncWithFallback(syncButton, originalText);
+      }
+    }
+  }
+  
+  async _syncWithOmadaController(syncButton, originalText) {
+    try {
+      const syncResult = await this._syncDeviceNamesWithOmada();
+      
+      if (syncResult.foundUpdates > 0) {
+        // Show detailed results
+        console.log('Name sync results:', syncResult);
+        
+        // Display results to user
+        let message = `Encontradas ${syncResult.foundUpdates} diferenças de nomes:`;
+        syncResult.updates.forEach(update => {
+          console.log(`${update.mac}: "${update.currentName}" -> "${update.omadaName}"`);
+          message += `\n• ${update.currentName} -> ${update.omadaName}`;
+        });
+        
+        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Sincronização completa!</span>';
         syncButton.classList.add('success');
         
-        setTimeout(() => {
-          this._restoreSyncButton(syncButton, originalText);
-        }, 3000);
-      }).catch(error => {
-        // Error
-        console.error('Error syncing device names:', error);
-        syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Erro na sincronização!</span>';
+        // Show notification with details
+        this._showNotification(`Sincronização do Omada: ${syncResult.foundUpdates} diferenças encontradas. Verifique o console para detalhes.`, 'success');
+        
+      } else {
+        syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Nomes já sincronizados!</span>';
+        syncButton.classList.add('success');
+        
+        this._showNotification(`Todos os ${syncResult.totalOmadaDevices} dispositivos já estão com nomes atualizados.`, 'success');
+      }
+      
+      setTimeout(() => {
+        this._restoreSyncButton(syncButton, originalText);
+      }, 5000);
+      
+    } catch (error) {
+      console.error('Omada sync failed:', error);
+      syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Erro na conexão Omada!</span>';
+      syncButton.classList.add('error');
+      
+      this._showNotification(`Erro ao conectar com Omada: ${error.message}`, 'error');
+      
+      setTimeout(() => {
+        // Try fallback method
+        this._syncWithFallback(syncButton, originalText);
+      }, 2000);
+    }
+  }
+  
+  _syncWithFallback(syncButton, originalText) {
+    const serviceName = `${this.config.service_domain}.${this.config.sync_service_action}`;
+    
+    this._hass.callService(
+      this.config.service_domain,
+      this.config.sync_service_action,
+      {}
+    ).then(() => {
+      syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Atualizado com sucesso!</span>';
+      syncButton.classList.add('success');
+      
+      setTimeout(() => {
+        this._restoreSyncButton(syncButton, originalText);
+      }, 3000);
+    }).catch(error => {
+      console.error(`Error calling service ${serviceName}:`, error);
+      
+      // Try to reload integration
+      if (this._hass.config_entries) {
+        const omadaEntry = Object.values(this._hass.config_entries).find(entry => 
+          entry.domain === this.config.service_domain);
+        
+        if (omadaEntry) {
+          this._hass.callService('homeassistant', 'reload_config_entry', {
+            entry_id: omadaEntry.entry_id
+          }).then(() => {
+            syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Integração recarregada!</span>';
+            syncButton.classList.add('success');
+            
+            setTimeout(() => {
+              this._restoreSyncButton(syncButton, originalText);
+            }, 3000);
+          }).catch(() => {
+            // Final fallback: just refresh the card
+            syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Card atualizado!</span>';
+            syncButton.classList.add('success');
+            this._throttledRender();
+            
+            setTimeout(() => {
+              this._restoreSyncButton(syncButton, originalText);
+            }, 3000);
+          });
+        } else {
+          // Just refresh the card
+          syncButton.innerHTML = '<ha-icon icon="mdi:check"></ha-icon><span> Card atualizado!</span>';
+          syncButton.classList.add('success');
+          this._throttledRender();
+          
+          setTimeout(() => {
+            this._restoreSyncButton(syncButton, originalText);
+          }, 3000);
+        }
+      } else {
+        syncButton.innerHTML = '<ha-icon icon="mdi:alert"></ha-icon><span> Serviço não encontrado!</span>';
         syncButton.classList.add('error');
         
         setTimeout(() => {
           this._restoreSyncButton(syncButton, originalText);
         }, 3000);
+      }
+    });
+  }
+  
+  _showNotification(message, type = 'info') {
+    if (this._hass && this._hass.callService) {
+      this._hass.callService('persistent_notification', 'create', {
+        message: message,
+        title: 'RSSI Device Grid',
+        notification_id: `rssi_grid_${Date.now()}`
       });
+    } else {
+      // Fallback to console
+      console.log(`[${type.toUpperCase()}] ${message}`);
     }
   }
   
@@ -1507,5 +1822,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'rssi-device-grid',
   name: 'RSSI Device Grid',
-  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality and name sync - Optimized Version'
+  description: 'Displays entities with RSSI and their associated device_tracker information with reconnect functionality and direct Omada name sync - Optimized Version'
 });
